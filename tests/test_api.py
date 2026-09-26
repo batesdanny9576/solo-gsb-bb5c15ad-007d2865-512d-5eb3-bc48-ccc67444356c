@@ -28,6 +28,35 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
+def _wait_ready(base: str, timeout: float = 15.0) -> None:
+    deadline = time.time() + timeout
+    last = None
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(f"{base}/health", timeout=1) as resp:
+                if resp.status == 200:
+                    return
+        except Exception as exc:  # 启动期间连接被拒是正常的
+            last = exc
+            time.sleep(0.2)
+    raise RuntimeError(f"服务未在 {timeout}s 内就绪: {last}")
+
+
+def _request(base: str, method: str, path: str, body: dict | None = None):
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(
+        f"{base}{path}",
+        data=data,
+        method=method,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status, json.loads(resp.read().decode())
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read().decode())
+
+
 class ServerThread(threading.Thread):
     def __init__(self, db_file: str, port: int) -> None:
         super().__init__(daemon=True)
@@ -57,21 +86,7 @@ class ApiTests(unittest.TestCase):
         cls.base = f"http://127.0.0.1:{port}"
         cls.server = ServerThread(db_file, port)
         cls.server.start()
-        cls._wait_ready()
-
-    @classmethod
-    def _wait_ready(cls, timeout: float = 15.0) -> None:
-        deadline = time.time() + timeout
-        last = None
-        while time.time() < deadline:
-            try:
-                with urllib.request.urlopen(f"{cls.base}/health", timeout=1) as resp:
-                    if resp.status == 200:
-                        return
-            except Exception as exc:  # 启动期间连接被拒是正常的
-                last = exc
-                time.sleep(0.2)
-        raise RuntimeError(f"服务未在 {timeout}s 内就绪: {last}")
+        _wait_ready(cls.base)
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -79,18 +94,7 @@ class ApiTests(unittest.TestCase):
         os.environ.pop("DB_PATH", None)
 
     def _request(self, method: str, path: str, body: dict | None = None):
-        data = json.dumps(body).encode() if body is not None else None
-        req = urllib.request.Request(
-            f"{self.base}{path}",
-            data=data,
-            method=method,
-            headers={"Content-Type": "application/json"},
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                return resp.status, json.loads(resp.read().decode())
-        except urllib.error.HTTPError as exc:
-            return exc.code, json.loads(exc.read().decode())
+        return _request(self.base, method, path, body)
 
     def test_01_health(self) -> None:
         status, body = self._request("GET", "/health")
@@ -3645,6 +3649,114 @@ class ApiTests(unittest.TestCase):
                     Decimal(g["invoiced"][col]) - Decimal(g["credited"][col]),
                     (code, col),
                 )
+
+
+class ChunkedApiTests(unittest.TestCase):
+    """超大 ID 集合下收款余额读取链路的端到端验证（独立服务与数据库）。
+
+    直接向服务库批量写入 600 张发票及收款/冲销（超过 app.db._IN_CHUNK_SIZE
+    的固定批量，收款/冲销读取必然分段），再经真实 HTTP 查询应收账龄汇总与
+    逾期列表：分段取数对调用方透明，结果与小批量一致。
+    """
+
+    server: ServerThread
+    tmpdir: tempfile.TemporaryDirectory
+    base: str
+    db_file: str
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.tmpdir = tempfile.TemporaryDirectory()
+        cls.db_file = str(Path(cls.tmpdir.name) / "chunked_api.db")
+        os.environ["DB_PATH"] = cls.db_file
+        port = _free_port()
+        cls.base = f"http://127.0.0.1:{port}"
+        cls.server = ServerThread(cls.db_file, port)
+        cls.server.start()
+        _wait_ready(cls.base)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.tmpdir.cleanup()
+        os.environ.pop("DB_PATH", None)
+
+    def _request(self, method: str, path: str, body: dict | None = None):
+        return _request(self.base, method, path, body)
+
+    def test_01_aging_and_overdue_with_huge_id_set(self) -> None:
+        import sqlite3
+
+        n = 600  # > app.db._IN_CHUNK_SIZE：收款/冲销的 IN 查询必然分段
+        conn = sqlite3.connect(self.db_file, timeout=30)
+        try:
+            conn.executemany(
+                """
+                INSERT INTO invoices (
+                    currency, currency_digits, total_net, total_tax, total_gross,
+                    residual_units, rule_id, request_json, due_date, created_at
+                ) VALUES ('USD', 2, '100.00', '0.00', '100.00', 0, 'test', '{}',
+                          '2026-01-01', '2026-01-01T00:00:00Z')
+                """,
+                [()] * n,
+            )
+            invoice_ids = [
+                r[0] for r in conn.execute("SELECT id FROM invoices ORDER BY id")
+            ]
+            self.assertEqual(len(invoice_ids), n)
+            conn.executemany(
+                "INSERT INTO payments (invoice_id, amount, currency, created_at)"
+                " VALUES (?, '10.00', 'USD', '2026-01-02T00:00:00Z')",
+                [(iid,) for iid in invoice_ids],
+            )
+            payment_ids = [
+                r[0] for r in conn.execute("SELECT id FROM payments ORDER BY id")
+            ]
+            self.assertEqual(len(payment_ids), n)
+            conn.executemany(
+                "INSERT INTO payment_reversals (payment_id, amount, currency, created_at)"
+                " VALUES (?, '1.00', 'USD', '2026-01-03T00:00:00Z')",
+                [(pid,) for pid in payment_ids],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        # 应收账龄汇总：全库 600 张发票的收款/冲销分段取数后逐笔 Decimal 合并
+        status, aging = self._request(
+            "GET", "/api/v1/receivables/aging?as_of=2026-01-15"
+        )
+        self.assertEqual(status, 200, aging)
+        self.assertEqual(aging["cutoff_at"], "2026-01-15T23:59:59Z")
+        self.assertEqual(len(aging["currencies"]), 1)
+        usd = aging["currencies"][0]
+        self.assertEqual(usd["currency"], "USD")
+        self.assertEqual(usd["invoice_count"], n)
+        # 每张净入账 10.00 − 1.00 = 9.00，未收 91.00；600 × 91.00 = 54600.00
+        self.assertEqual(usd["total_outstanding"], "54600.00")
+        buckets = {b["bucket"]: b for b in usd["buckets"]}
+        self.assertEqual(buckets["overdue_1_30"]["invoice_count"], n)
+        self.assertEqual(buckets["overdue_1_30"]["outstanding"], "54600.00")
+
+        # 逾期列表：total 覆盖全部 600 张，逐页核对金额口径与 id 倒序
+        seen = 0
+        last_id = None
+        for page in range(1, 7):
+            status, body = self._request(
+                "GET",
+                f"/api/v1/invoices/overdue?page={page}&page_size=100&as_of=2026-01-15",
+            )
+            self.assertEqual(status, 200, body)
+            self.assertEqual(body["total"], n)
+            self.assertEqual(body["pages"], 6)
+            for item in body["items"]:
+                self.assertEqual(item["total_gross"], "100.00")
+                self.assertEqual(item["paid_total"], "9.00")
+                self.assertEqual(item["outstanding"], "91.00")
+                if last_id is not None:
+                    self.assertLess(item["id"], last_id)
+                last_id = item["id"]
+            seen += len(body["items"])
+        self.assertEqual(seen, n)
 
 
 if __name__ == "__main__":
