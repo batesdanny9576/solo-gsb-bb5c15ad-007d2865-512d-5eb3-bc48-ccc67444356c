@@ -34,6 +34,14 @@
 原样累加，输出时才按**该组实际参与记录中最高的入库小数位**格式化（账龄桶取
 落桶发票、税额组取组内发票行与贷项凭证行），组精度取 ``max`` 而非首条记录的
 位数，因此查询结果与插入顺序无关。
+
+收款余额读取链路（对发票 ID 集合查收款、对收款 ID 集合查冲销）统一**按固定且
+小于 SQLite 绑定参数上限的批量大小分段取数**（见 :data:`_ID_QUERY_BATCH_SIZE`）：
+截止时点（``created_at <= ?``）这类额外参数同样计入单条语句的绑定预算；ID
+集合为空时不发起任何查询。分段只改变取数方式：所有分段取回的流水仍在**同一
+个足量局部精度上下文**里用 Decimal 逐笔合并，绝不使用 SQL 浮点 SUM 聚合，因此
+超大 ID 集合（逾期列表、账龄汇总、收款概览、历史快照等复用路径）可正常查询，
+且结果与小批量逐张查询完全一致；收款与冲销各自的 UTC 截止秒闭区间口径不变。
 """
 
 from __future__ import annotations
@@ -41,6 +49,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+from collections.abc import Iterator
 from datetime import date, datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any
@@ -221,6 +230,22 @@ class PlanAlreadyExistsError(Exception):
         )
 
 
+# 收款余额读取链路中，对发票 ID 集合 / 收款 ID 集合做 IN 取数时的**固定**单批
+# 大小：单条语句的占位符数 = 本批 ID 数 + 其余绑定参数（如截止时点 1 个）。
+# SQLite 默认 SQLITE_MAX_VARIABLE_NUMBER 为 999（3.32+ 提升到 32766），900
+# 个 ID 位即使再叠加截止时点（901 个绑定）也严格小于 999，使超大 ID 集合在
+# 旧版 SQLite 上同样可查询。修改该常量时必须保证与任何调用点的额外绑定数之和
+# 仍低于 999。
+_ID_QUERY_BATCH_SIZE = 900
+
+
+def _id_batches(ids: list[int]) -> Iterator[list[int]]:
+    """把 ID 集合按 :data:`_ID_QUERY_BATCH_SIZE` 切分（空集合不产出任何批次）。"""
+
+    for start in range(0, len(ids), _ID_QUERY_BATCH_SIZE):
+        yield ids[start : start + _ID_QUERY_BATCH_SIZE]
+
+
 def utc_now_iso() -> str:
     """UTC 时间，ISO 8601 带 Z 后缀，秒精度。"""
 
@@ -384,8 +409,9 @@ def list_overdue_invoices(
     得到的未收余额（total_gross − 净入账合计，净入账 = Σ payments − Σ reversals）
     **大于 0**；缺少到期日、已收满（余额 0）的发票不纳入。结果按 id 倒序。
 
-    未收余额不走 SQLite 浮点聚合：一次性取回候选发票的收款与冲销流水，在
-    Python 侧用 Decimal 逐发票（每张发票币种单一）求和。
+    未收余额不走 SQLite 浮点聚合：候选发票的收款与冲销流水按固定批量分段取回
+    （超大发票集合也可查询，空集合不查询），全部流水在 Python 侧用 Decimal
+    逐发票（每张发票币种单一）、在同一足量局部精度下求和，结果与一次性取数一致。
     """
 
     as_of_text = as_of.isoformat()
@@ -438,26 +464,91 @@ def _minor_unit(digits: int) -> Decimal:
     return Decimal(1).scaleb(-digits)
 
 
-def _paid_totals_as_of(
-    conn: sqlite3.Connection, invoice_ids: list[int], at_text: str
-) -> dict[int, Decimal]:
-    """一批发票截至 UTC 秒精度时点 ``at_text`` 的净入账合计（收款 − 冲销）。
+def _payment_rows(
+    conn: sqlite3.Connection,
+    invoice_ids: list[int],
+    at_text: str | None = None,
+) -> list[sqlite3.Row]:
+    """按发票 ID 集合分段取回收款流水。
 
-    与 :func:`_paid_totals` 同口径，但只计入 ``created_at <= at_text``（截止秒
-    闭区间，同秒流水全部计入）的收款；冲销沿用 :func:`_reversed_totals` 的
-    ``at_text`` 过滤，按其自身登记时间独立筛选。用 Decimal 逐笔求和，不走 SQLite
-    的浮点 SUM 聚合。供应收账龄汇总（截止到查询日 UTC 23:59:59）使用。
+    发票 ID 按 :data:`_ID_QUERY_BATCH_SIZE` 分段，``at_text`` 给出 UTC 秒精度
+    截止时点时只取 ``created_at <= at_text``（截止秒闭区间）的流水——该截止参数
+    与本批 ID 同属一条语句的绑定预算（900 个 ID 位 + 1 个截止位 = 901，仍小于
+    SQLite 999 的绑定上限）。空集合不查询。各分段按 ID 升序取回后再整体按 id
+    排序，保证跨分段结果与一次性取数完全同序。
     """
 
     if not invoice_ids:
-        return {}
-    placeholders = ",".join("?" for _ in invoice_ids)
-    rows = conn.execute(
-        f"SELECT id, invoice_id, amount FROM payments"
-        f" WHERE invoice_id IN ({placeholders}) AND created_at <= ?",
-        (*invoice_ids, at_text),
-    ).fetchall()
-    reversed_map = _reversed_totals(conn, [int(r["id"]) for r in rows], at_text=at_text)
+        return []
+    out: list[sqlite3.Row] = []
+    for batch in _id_batches(invoice_ids):
+        placeholders = ",".join("?" for _ in batch)
+        if at_text is None:
+            rows = conn.execute(
+                "SELECT id, invoice_id, amount FROM payments"
+                f" WHERE invoice_id IN ({placeholders})",
+                batch,
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id, invoice_id, amount FROM payments"
+                f" WHERE invoice_id IN ({placeholders}) AND created_at <= ?",
+                (*batch, at_text),
+            ).fetchall()
+        out.extend(rows)
+    out.sort(key=lambda r: int(r["id"]))
+    return out
+
+
+def _reversal_rows(
+    conn: sqlite3.Connection,
+    payment_ids: list[int],
+    at_text: str | None = None,
+    columns: str = "id, payment_id, amount",
+) -> list[sqlite3.Row]:
+    """按收款 ID 集合分段取回冲销流水。
+
+    收款 ID 按 :data:`_ID_QUERY_BATCH_SIZE` 分段，``at_text`` 给出 UTC 秒精度
+    截止时点时只取 ``created_at <= at_text``（截止秒闭区间，冲销按其自身登记时间
+    独立过滤）的流水——截止参数计入单条语句绑定预算（900 + 1 = 901 < 999）。
+    ``columns`` 控制返回列（合计只需 ``id, payment_id, amount``——``id`` 用于跨
+    分段后整体排序，历史快照需要整行 ``r.*``）。空集合不查询；各分段取回后
+    整体按 id 排序，跨分段结果与一次性取数完全同序。
+    """
+
+    if not payment_ids:
+        return []
+    table_prefix = "r." if columns == "r.*" else ""
+    where_pid = f"{table_prefix}payment_id"
+    where_created = f"{table_prefix}created_at"
+    sql = (
+        f"SELECT {columns} FROM payment_reversals r"
+        if table_prefix
+        else f"SELECT {columns} FROM payment_reversals"
+    )
+    out: list[sqlite3.Row] = []
+    for batch in _id_batches(payment_ids):
+        placeholders = ",".join("?" for _ in batch)
+        statement = f"{sql} WHERE {where_pid} IN ({placeholders})"
+        params: list[Any] = list(batch)
+        if at_text is not None:
+            statement += f" AND {where_created} <= ?"
+            params.append(at_text)
+        rows = conn.execute(statement, params).fetchall()
+        out.extend(rows)
+    out.sort(key=lambda r: int(r["id"]))
+    return out
+
+
+def _merge_net_paid(
+    rows: list[sqlite3.Row], reversed_map: dict[int, Decimal]
+) -> dict[int, Decimal]:
+    """把分段取回的全部收款流水在**同一个足量局部精度**下逐笔合并为净入账合计。
+
+    收款金额与冲销合计都在同一 :func:`money_context` 内做 Decimal 加减（不走
+    SQLite 浮点 SUM），因此分几段取回与一次性取回的合并结果完全一致。
+    """
+
     amounts = [Decimal(r["amount"]) for r in rows]
     paid: dict[int, Decimal] = {}
     with money_context([*amounts, *reversed_map.values()], len(rows)):
@@ -468,12 +559,37 @@ def _paid_totals_as_of(
     return paid
 
 
+def _paid_totals_as_of(
+    conn: sqlite3.Connection, invoice_ids: list[int], at_text: str
+) -> dict[int, Decimal]:
+    """一批发票截至 UTC 秒精度时点 ``at_text`` 的净入账合计（收款 − 冲销）。
+
+    与 :func:`_paid_totals` 同口径，但只计入 ``created_at <= at_text``（截止秒
+    闭区间，同秒流水全部计入）的收款；冲销沿用 :func:`_reversed_totals` 的
+    ``at_text`` 过滤，按其自身登记时间独立筛选。收款与冲销的 ID 取数都按
+    :data:`_ID_QUERY_BATCH_SIZE` 分段（截止参数计入单语句绑定预算、空集合不查询），
+    全部流水在同一局部精度内用 Decimal 逐笔合并，不走 SQLite 的浮点 SUM 聚合。
+    供应收账龄汇总（截止到查询日 UTC 23:59:59）使用。
+    """
+
+    if not invoice_ids:
+        return {}
+    rows = _payment_rows(conn, invoice_ids, at_text=at_text)
+    reversed_map = _reversed_totals(conn, [int(r["id"]) for r in rows], at_text=at_text)
+    return _merge_net_paid(rows, reversed_map)
+
+
 def _reversed_totals(
     conn: sqlite3.Connection,
     payment_ids: list[int],
     at_text: str | None = None,
 ) -> dict[int, Decimal]:
-    """一批收款流水的已冲销合计。用 Decimal 逐笔求和，不走 SQLite 的浮点 SUM 聚合。
+    """一批收款流水的已冲销合计。
+
+    收款 ID 按 :data:`_ID_QUERY_BATCH_SIZE` 分段取数（``at_text`` 截止参数计入
+    单语句绑定预算、空集合不查询），所有分段取回的冲销在**同一个足量局部精度**
+    内用 Decimal 逐笔求和，不走 SQLite 的浮点 SUM 聚合，因此分段与一次性取数
+    结果完全一致。
 
     ``at_text`` 给出 UTC 秒精度截止时点（``YYYY-MM-DDTHH:MM:SSZ``）时，只合计
     ``created_at <= at_text`` 的冲销（截止秒为闭区间，同秒计入），供历史快照
@@ -482,19 +598,7 @@ def _reversed_totals(
 
     if not payment_ids:
         return {}
-    placeholders = ",".join("?" for _ in payment_ids)
-    if at_text is None:
-        rows = conn.execute(
-            "SELECT payment_id, amount FROM payment_reversals"
-            f" WHERE payment_id IN ({placeholders})",
-            payment_ids,
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT payment_id, amount FROM payment_reversals"
-            f" WHERE payment_id IN ({placeholders}) AND created_at <= ?",
-            (*payment_ids, at_text),
-        ).fetchall()
+    rows = _reversal_rows(conn, payment_ids, at_text=at_text)
     amounts = [Decimal(r["amount"]) for r in rows]
     totals: dict[int, Decimal] = {}
     with money_context(amounts, len(rows)):
@@ -679,24 +783,18 @@ def reverse_payment(
 
 
 def _paid_totals(conn: sqlite3.Connection, invoice_ids: list[int]) -> dict[int, Decimal]:
-    """一批发票的净入账合计（收款 − 冲销）。用 Decimal 逐笔求和，不走浮点 SUM 聚合。"""
+    """一批发票的净入账合计（收款 − 冲销）。
+
+    收款与冲销的 ID 取数都按 :data:`_ID_QUERY_BATCH_SIZE` 分段（空集合不查询），
+    全部流水在同一个足量局部精度内用 Decimal 逐笔求和，不走浮点 SUM 聚合，
+    分段与一次性取数结果完全一致。
+    """
 
     if not invoice_ids:
         return {}
-    placeholders = ",".join("?" for _ in invoice_ids)
-    rows = conn.execute(
-        f"SELECT id, invoice_id, amount FROM payments WHERE invoice_id IN ({placeholders})",
-        invoice_ids,
-    ).fetchall()
+    rows = _payment_rows(conn, invoice_ids)
     reversed_map = _reversed_totals(conn, [int(r["id"]) for r in rows])
-    amounts = [Decimal(r["amount"]) for r in rows]
-    paid: dict[int, Decimal] = {}
-    with money_context([*amounts, *reversed_map.values()], len(rows)):
-        for r, amount in zip(rows, amounts):
-            iid = int(r["invoice_id"])
-            net = amount - reversed_map.get(int(r["id"]), Decimal("0"))
-            paid[iid] = paid.get(iid, Decimal("0")) + net
-    return paid
+    return _merge_net_paid(rows, reversed_map)
 
 
 def allocate_payment(
@@ -759,14 +857,18 @@ def allocate_payment(
         if len(invoice_ids) != len(set(invoice_ids)):
             raise ValueError("invoice_ids 不得包含重复的发票 ID")
 
-        placeholders = ",".join("?" for _ in invoice_ids)
-        rows = list(
-            conn.execute(
-                f"SELECT id, currency, currency_digits, due_date, total_gross"
-                f" FROM invoices WHERE id IN ({placeholders})",
-                invoice_ids,
-            ).fetchall()
-        )
+        # 发票头同样按固定批量分段取回（超大候选集合也可查询）：这里只构造
+        # id -> row 映射，分段顺序无影响；未命中的发票在下面统一报 404。
+        rows: list[sqlite3.Row] = []
+        for batch in _id_batches(invoice_ids):
+            placeholders = ",".join("?" for _ in batch)
+            rows.extend(
+                conn.execute(
+                    f"SELECT id, currency, currency_digits, due_date, total_gross"
+                    f" FROM invoices WHERE id IN ({placeholders})",
+                    batch,
+                ).fetchall()
+            )
         found = {int(r["id"]): r for r in rows}
         for invoice_id in invoice_ids:
             if invoice_id not in found:
@@ -985,21 +1087,25 @@ def reverse_allocation_batch(
         payment_ids = [int(r["payment_id"]) for r in item_rows]
         reversed_map = _reversed_totals(conn, payment_ids)
 
-        # 批次明细此前已记录的整批撤销冲销（重复请求时回显其金额/流水号/时间）
+        # 批次明细此前已记录的整批撤销冲销（重复请求时回显其金额/流水号/时间）。
+        # 按主键 id 集合同样分段取数（固定批量、空集合不查询），避免超大批次
+        # 超过 SQLite 单语句绑定参数上限。
         prior_reversal_ids = [
             int(r["reversal_id"]) for r in item_rows if r["reversal_id"] is not None
         ]
         prior_rows: dict[int, sqlite3.Row] = {}
-        if prior_reversal_ids:
-            placeholders = ",".join("?" for _ in prior_reversal_ids)
-            prior_rows = {
-                int(r["id"]): r
-                for r in conn.execute(
-                    f"SELECT id, amount, created_at FROM payment_reversals"
-                    f" WHERE id IN ({placeholders})",
-                    prior_reversal_ids,
-                ).fetchall()
-            }
+        for id_batch in _id_batches(prior_reversal_ids):
+            placeholders = ",".join("?" for _ in id_batch)
+            prior_rows.update(
+                {
+                    int(r["id"]): r
+                    for r in conn.execute(
+                        "SELECT id, amount, created_at FROM payment_reversals"
+                        f" WHERE id IN ({placeholders})",
+                        id_batch,
+                    ).fetchall()
+                }
+            )
 
         prec_amounts = [Decimal(r["payment_amount"]) for r in item_rows]
         prec_amounts += [Decimal(r["allocated"]) for r in item_rows]
@@ -1204,19 +1310,9 @@ def payment_snapshot(
     payment_ids = [int(r["id"]) for r in payment_rows]
     reversed_map = _reversed_totals(conn, payment_ids, at_text=at_text)
 
-    reversal_rows: list[sqlite3.Row] = []
-    if payment_ids:
-        placeholders = ",".join("?" for _ in payment_ids)
-        reversal_rows = list(
-            conn.execute(
-                f"""
-                SELECT r.* FROM payment_reversals r
-                WHERE r.payment_id IN ({placeholders}) AND r.created_at <= ?
-                ORDER BY r.id
-                """,
-                (*payment_ids, at_text),
-            ).fetchall()
-        )
+    # 冲销明细按收款 ID 集合分段取回（截止参数计入单语句绑定预算、空集合不查询），
+    # _reversal_rows 已按 id 全局排序，等价于原先的 ORDER BY r.id
+    reversal_rows = _reversal_rows(conn, payment_ids, at_text=at_text, columns="r.*")
 
     unit = _minor_unit(int(invoice["currency_digits"]))
     gross = Decimal(invoice["total_gross"])
